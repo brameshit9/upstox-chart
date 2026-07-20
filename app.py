@@ -303,19 +303,9 @@ def compute_atr(df, period=ATR_PERIOD):
 
 # =========================================================
 # CPR VOLUME PROFILE — POC / VAH / VAL
-# (Same logic as the Pine Script's volume-profile block:
-#  bin the current session's candles by typical price, find
-#  the highest-volume bin (POC), then expand outward bin by
-#  bin — always stepping to whichever side has more volume —
-#  until the accumulated volume reaches VP_VALUE_AREA_PCT of
-#  the day's total. VAH/VAL are the outer edges of that band.)
 # =========================================================
 
 def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
-    """
-    df: intraday dataframe for the CURRENT session only (already sliced to today).
-    Returns dict(poc=None, vah=None, val=None) if not enough data.
-    """
     result = dict(poc=None, vah=None, val=None)
     if df is None or len(df) == 0:
         return result
@@ -368,16 +358,6 @@ def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PC
 
 
 def compute_cpr_vp_boxes(df, period_min=VP_PERIOD_MIN, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
-    """
-    Splits the session into consecutive `period_min` (e.g. 30-min) buckets,
-    aligned to the session's FIRST candle (market open, e.g. 9:15) rather
-    than clock boundaries (9:00/9:30) — so each box is a clean, full 30-min
-    window: 9:15-9:45, 9:45-10:15, 10:15-10:45, etc. Computes a separate
-    POC/VAH/VAL for each bucket — same banded/gapped box look as the Pine
-    Script CPR/Volume-Profile block, but derived from the live intraday
-    candles instead of a security() pivot timeframe.
-    Returns a list of dicts: start, end, poc, vah, val (chronological order).
-    """
     boxes = []
     if df is None or len(df) == 0:
         return boxes
@@ -599,18 +579,43 @@ def build_chart(r):
     if cpr and len(df) > 0:
         x0, x1 = df["Datetime"].iloc[0], df["Datetime"].iloc[-1]
         top, bottom = max(cpr["tc"], cpr["bc"]), min(cpr["tc"], cpr["bc"])
+
+        # Narrow-CPR days (TC/BC only a rupee or two apart) used to collapse
+        # into an invisible hairline at 8% opacity. Pad the drawn band by a
+        # small fraction of the visible price range so it always reads as a
+        # proper box, and bump the fill opacity so it's clearly visible.
+        price_span = float(df["High"].max() - df["Low"].min()) or 1.0
+        min_band = price_span * 0.004
+        draw_top, draw_bottom = top, bottom
+        if (draw_top - draw_bottom) < min_band:
+            mid = (draw_top + draw_bottom) / 2
+            draw_top, draw_bottom = mid + min_band / 2, mid - min_band / 2
+
         fig.add_shape(
-            type="rect", x0=x0, x1=x1, y0=bottom, y1=top,
-            line=dict(color=C_CPR_BORDER, width=1.2, dash="dash"),
-            fillcolor=C_CPR_FILL, layer="below",
+            type="rect", x0=x0, x1=x1, y0=draw_bottom, y1=draw_top,
+            line=dict(color=C_CPR_BORDER, width=1.6, dash="dot"),
+            fillcolor="rgba(126,87,194,0.18)", layer="below",
         )
         fig.add_trace(go.Scatter(
             x=[x0, x1], y=[cpr["pivot"], cpr["pivot"]], mode="lines",
             line=dict(color=C_CPR_PIVOT, width=1.4, dash="dash"), name="CPR Pivot",
         ))
-        for label, val in (("TC", cpr["tc"]), ("Pivot", cpr["pivot"]), ("BC", cpr["bc"])):
-            fig.add_annotation(x=x1, y=val, text=f"{label} {val}", showarrow=False,
-                                xanchor="left", font=dict(color=C_CPR_PIVOT, size=10))
+
+        # Single consolidated label (stacked lines, offset to the right of the
+        # last candle) instead of three separate annotations placed at their
+        # exact y-values — those used to overlap into unreadable text
+        # whenever TC/Pivot/BC were close together.
+        label_text = (
+            f"<b>TC</b> {cpr['tc']:.2f}<br>"
+            f"<b>P</b> {cpr['pivot']:.2f}<br>"
+            f"<b>BC</b> {cpr['bc']:.2f}"
+        )
+        fig.add_annotation(
+            x=x1, y=(draw_top + draw_bottom) / 2, text=label_text, showarrow=False,
+            xanchor="left", xshift=8, align="left",
+            font=dict(color=C_CPR_PIVOT, size=10),
+            bgcolor="rgba(255,255,255,0.85)", bordercolor=C_CPR_BORDER, borderwidth=1,
+        )
 
     pn = sum(r["checks"].values())
     fig.update_layout(
