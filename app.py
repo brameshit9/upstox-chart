@@ -12,7 +12,7 @@ import gzip
 import io
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -57,6 +57,7 @@ C_BULL_BG, C_BEAR_BG, C_NEUT_BG = "#FFFFFF", "#FFFFFF", "#FFFFFF"
 C_MUTED, C_BOS, C_BIGC, C_CHOCH = "#9A9590", "#2196F3", "#FF9800", "#7B5EA7"
 C_GRID = "#E6E9EC"
 C_VP_BORDER, C_VP_FILL, C_POC = "#1E88E5", "rgba(30,136,229,0.10)", "#1E88E5"
+C_CPR_BORDER, C_CPR_FILL, C_CPR_PIVOT = "#7E57C2", "rgba(126,87,194,0.08)", "#7E57C2"  # TC/Pivot/BC box
 
 # NSE trading symbols to scan (subset shown; add/remove freely in the UI)
 STOCKS = [
@@ -191,6 +192,60 @@ def fetch_intraday(instrument_key: str, interval_min: str = INTRADAY_INTERVAL_MI
     for col in ("Open", "High", "Low", "Close", "Volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df, None
+
+# =========================================================
+# CPR (Central Pivot Range) — TC / Pivot / BC
+# Uses the PREVIOUS completed day's High/Low/Close, exactly
+# like the Pine script's `request.security(..., pivotTF="D",
+# [high[1], low[1], close[1]])`:
+#   pivot = (pH + pL + pC) / 3
+#   bc    = (pH + pL) / 2
+#   tc    = (pivot - bc) + pivot
+# =========================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_daily_candles_cached(instrument_key: str, token: str, to_date: str, from_date: str):
+    url = f"{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return None
+    candles = resp.json().get("data", {}).get("candles", [])
+    if not candles:
+        return None
+    df = pd.DataFrame(candles, columns=["Datetime", "Open", "High", "Low", "Close", "Volume", "OI"])
+    df["Datetime"] = pd.to_datetime(df["Datetime"])
+    df = df.sort_values("Datetime").reset_index(drop=True)
+    for col in ("Open", "High", "Low", "Close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def get_cpr_pivot(instrument_key: str):
+    """
+    Returns dict(pivot, tc, bc) computed from the previous completed
+    trading day's High/Low/Close, or None if unavailable.
+    """
+    token = st.session_state.get("access_token")
+    if not token:
+        return None
+    today = datetime.now(IST).date()
+    from_date = today - timedelta(days=10)  # buffer for weekends/holidays
+    daily = _fetch_daily_candles_cached(instrument_key, token, today.isoformat(), from_date.isoformat())
+    if daily is None or daily.empty:
+        return None
+
+    prev = daily[daily["Datetime"].dt.date < today]
+    if prev.empty:
+        return None
+    last = prev.iloc[-1]
+    pH, pL, pC = float(last["High"]), float(last["Low"]), float(last["Close"])
+
+    pivot = (pH + pL + pC) / 3
+    bc = (pH + pL) / 2
+    tc = (pivot - bc) + pivot
+
+    return dict(pivot=round(pivot, 2), tc=round(tc, 2), bc=round(bc, 2))
 
 # =========================================================
 # INDICATORS
@@ -475,6 +530,9 @@ def analyze_stock(name, instrument_key, err_rows):
         vp_boxes = compute_cpr_vp_boxes(session_df)
         latest_vp = vp_boxes[-1] if vp_boxes else dict(poc=None, vah=None, val=None)
 
+        # ---- CPR (Central Pivot Range): TC / Pivot / BC from previous day's H/L/C ----
+        cpr = get_cpr_pivot(instrument_key)
+
         vol_raw = last["Volume"] if has_vol else 0
         volume = 0 if pd.isna(vol_raw) else int(vol_raw)
 
@@ -501,6 +559,7 @@ def analyze_stock(name, instrument_key, err_rows):
             last_sh=smc["last_sh"], last_sl=smc["last_sl"],
             ob_type=ob["ob_type"], ob_high=ob["ob_high"], ob_low=ob["ob_low"], ob_fresh=ob["ob_fresh"],
             poc=latest_vp["poc"], vah=latest_vp["vah"], val=latest_vp["val"], vp_boxes=vp_boxes,
+            cpr=cpr,
             checks=checks, df=df,
         )
     except Exception as e:
@@ -527,19 +586,31 @@ def build_chart(r):
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.4), name="VWAP"))
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"))
 
-    # ---- CPR Volume Profile: one dashed box per 30-min period (VAH/VAL band + POC line) ----
-    for i, box in enumerate(r.get("vp_boxes") or []):
+    # ---- CPR Volume Profile: one dashed box per 30-min period (VAH/VAL band) ----
+    for box in (r.get("vp_boxes") or []):
         fig.add_shape(
             type="rect", x0=box["start"], x1=box["end"], y0=box["val"], y1=box["vah"],
             line=dict(color=C_VP_BORDER, width=1.4, dash="dot"),
             fillcolor=C_VP_FILL, layer="below",
         )
+
+    # ---- CPR (Central Pivot Range): TC/Pivot/BC box from previous day's H/L/C ----
+    cpr = r.get("cpr")
+    if cpr and len(df) > 0:
+        x0, x1 = df["Datetime"].iloc[0], df["Datetime"].iloc[-1]
+        top, bottom = max(cpr["tc"], cpr["bc"]), min(cpr["tc"], cpr["bc"])
+        fig.add_shape(
+            type="rect", x0=x0, x1=x1, y0=bottom, y1=top,
+            line=dict(color=C_CPR_BORDER, width=1.2, dash="dash"),
+            fillcolor=C_CPR_FILL, layer="below",
+        )
         fig.add_trace(go.Scatter(
-            x=[box["start"], box["end"]], y=[box["poc"], box["poc"]],
-            mode="lines", line=dict(color=C_POC, width=1.6),
-            name="POC" if i == 0 else None, showlegend=(i == 0),
-            legendgroup="poc", hoverinfo="skip",
+            x=[x0, x1], y=[cpr["pivot"], cpr["pivot"]], mode="lines",
+            line=dict(color=C_CPR_PIVOT, width=1.4, dash="dash"), name="CPR Pivot",
         ))
+        for label, val in (("TC", cpr["tc"]), ("Pivot", cpr["pivot"]), ("BC", cpr["bc"])):
+            fig.add_annotation(x=x1, y=val, text=f"{label} {val}", showarrow=False,
+                                xanchor="left", font=dict(color=C_CPR_PIVOT, size=10))
 
     pn = sum(r["checks"].values())
     fig.update_layout(
