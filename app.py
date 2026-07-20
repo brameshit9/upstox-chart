@@ -1,11 +1,9 @@
 # =========================================================
-# SMART MONEY INTRADAY SCANNER — Upstox + Streamlit  (v11 + CPR VP)
+# SMART MONEY INTRADAY SCANNER — Upstox + Streamlit  (v11, CPR removed)
 # =========================================================
-# Same as v11, with ONE addition: CPR-period Volume Profile
-# (POC / VAH / VAL) computed from the day's intraday candles,
-# mirroring the binning + value-area-expansion logic used in
-# the Pine Script indicator's volume profile section.
-# Nothing else was changed.
+# Same as v11, with CPR (pivot box) and CPR Volume Profile
+# (POC/VAH/VAL) removed entirely. Chart now shows only:
+# Candles + VWAP + EMA8.
 # =========================================================
 
 import gzip
@@ -45,19 +43,11 @@ OBV_SLOPE_N = 5
 SMC_IMPULSE = 1.2
 INTRADAY_INTERVAL_MIN = "1"  # 1-minute candles via v3 intraday API
 
-# ---- CPR Volume Profile (POC / VAH / VAL) settings ----
-VP_ROWS = 24            # number of price bins across each period's range (matches Pine "vpRows")
-VP_VALUE_AREA_PCT = 70  # % of volume that must sit inside VAH/VAL (matches Pine "valueAreaPct")
-VP_PERIOD_MIN = 30      # box period in minutes (the "CPR 30 min box")
-VP_MIN_BARS = 5         # skip a period's box if it has fewer 1-min candles than this (avoids noisy edge boxes)
-
 # Colour palette — TradingView-style
 C_BULL, C_BEAR, C_NEUTRAL = "#26A69A", "#EF5350", "#888780"
 C_BULL_BG, C_BEAR_BG, C_NEUT_BG = "#FFFFFF", "#FFFFFF", "#FFFFFF"
 C_MUTED, C_BOS, C_BIGC, C_CHOCH = "#9A9590", "#2196F3", "#FF9800", "#7B5EA7"
 C_GRID = "#E6E9EC"
-C_VP_BORDER, C_VP_FILL, C_POC = "#1E88E5", "rgba(30,136,229,0.10)", "#1E88E5"
-C_CPR_BORDER, C_CPR_FILL, C_CPR_PIVOT = "#7E57C2", "rgba(126,87,194,0.08)", "#7E57C2"  # TC/Pivot/BC box
 
 # NSE trading symbols to scan (subset shown; add/remove freely in the UI)
 STOCKS = [
@@ -194,60 +184,6 @@ def fetch_intraday(instrument_key: str, interval_min: str = INTRADAY_INTERVAL_MI
     return df, None
 
 # =========================================================
-# CPR (Central Pivot Range) — TC / Pivot / BC
-# Uses the PREVIOUS completed day's High/Low/Close, exactly
-# like the Pine script's `request.security(..., pivotTF="D",
-# [high[1], low[1], close[1]])`:
-#   pivot = (pH + pL + pC) / 3
-#   bc    = (pH + pL) / 2
-#   tc    = (pivot - bc) + pivot
-# =========================================================
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_daily_candles_cached(instrument_key: str, token: str, to_date: str, from_date: str):
-    url = f"{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}"
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        return None
-    candles = resp.json().get("data", {}).get("candles", [])
-    if not candles:
-        return None
-    df = pd.DataFrame(candles, columns=["Datetime", "Open", "High", "Low", "Close", "Volume", "OI"])
-    df["Datetime"] = pd.to_datetime(df["Datetime"])
-    df = df.sort_values("Datetime").reset_index(drop=True)
-    for col in ("Open", "High", "Low", "Close"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def get_cpr_pivot(instrument_key: str):
-    """
-    Returns dict(pivot, tc, bc) computed from the previous completed
-    trading day's High/Low/Close, or None if unavailable.
-    """
-    token = st.session_state.get("access_token")
-    if not token:
-        return None
-    today = datetime.now(IST).date()
-    from_date = today - timedelta(days=10)  # buffer for weekends/holidays
-    daily = _fetch_daily_candles_cached(instrument_key, token, today.isoformat(), from_date.isoformat())
-    if daily is None or daily.empty:
-        return None
-
-    prev = daily[daily["Datetime"].dt.date < today]
-    if prev.empty:
-        return None
-    last = prev.iloc[-1]
-    pH, pL, pC = float(last["High"]), float(last["Low"]), float(last["Close"])
-
-    pivot = (pH + pL + pC) / 3
-    bc = (pH + pL) / 2
-    tc = (pivot - bc) + pivot
-
-    return dict(pivot=round(pivot, 2), tc=round(tc, 2), bc=round(bc, 2))
-
-# =========================================================
 # INDICATORS
 # =========================================================
 
@@ -300,84 +236,6 @@ def compute_atr(df, period=ATR_PERIOD):
     hi, lo, cl = df["High"], df["Low"], df["Close"]
     tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
-
-# =========================================================
-# CPR VOLUME PROFILE — POC / VAH / VAL
-# =========================================================
-
-def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
-    result = dict(poc=None, vah=None, val=None)
-    if df is None or len(df) == 0:
-        return result
-
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
-    vols = df["Volume"].fillna(0).values
-
-    range_high = np.nanmax(highs)
-    range_low = np.nanmin(lows)
-    bin_size = (range_high - range_low) / rows
-    if not np.isfinite(bin_size) or bin_size <= 0:
-        return result
-
-    vol_bins = np.zeros(rows, dtype=float)
-    typ_price = (highs + lows + closes) / 3.0
-    bin_idx = np.floor((typ_price - range_low) / bin_size).astype(int)
-    bin_idx = np.clip(bin_idx, 0, rows - 1)
-    for idx, v in zip(bin_idx, vols):
-        vol_bins[idx] += v
-
-    total_vol = vol_bins.sum()
-    if total_vol <= 0:
-        return result
-
-    poc_idx = int(np.argmax(vol_bins))
-    target = total_vol * value_area_pct / 100.0
-    cum_vol = vol_bins[poc_idx]
-    lo_lim = hi_lim = poc_idx
-
-    while cum_vol < target and (lo_lim > 0 or hi_lim < rows - 1):
-        vol_below = vol_bins[lo_lim - 1] if lo_lim > 0 else -1.0
-        vol_above = vol_bins[hi_lim + 1] if hi_lim < rows - 1 else -1.0
-        if vol_below >= vol_above:
-            lo_lim -= 1
-            cum_vol += vol_below
-        else:
-            hi_lim += 1
-            cum_vol += vol_above
-
-    poc_price = range_low + poc_idx * bin_size + bin_size / 2
-    vah_price = range_low + (hi_lim + 1) * bin_size
-    val_price = range_low + lo_lim * bin_size
-
-    result["poc"] = round(float(poc_price), 2)
-    result["vah"] = round(float(vah_price), 2)
-    result["val"] = round(float(val_price), 2)
-    return result
-
-
-def compute_cpr_vp_boxes(df, period_min=VP_PERIOD_MIN, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
-    boxes = []
-    if df is None or len(df) == 0:
-        return boxes
-
-    session_start = df["Datetime"].iloc[0]
-    elapsed_min = (df["Datetime"] - session_start).dt.total_seconds() / 60.0
-    bucket_idx = np.floor(elapsed_min / period_min).astype(int)
-
-    for _, grp in df.groupby(bucket_idx):
-        if len(grp) < VP_MIN_BARS:
-            continue
-        vp = compute_cpr_volume_profile(grp, rows=rows, value_area_pct=value_area_pct)
-        if vp["poc"] is None:
-            continue
-        boxes.append(dict(
-            start=grp["Datetime"].iloc[0],
-            end=grp["Datetime"].iloc[-1],
-            poc=vp["poc"], vah=vp["vah"], val=vp["val"],
-        ))
-    return boxes
 
 # =========================================================
 # SMART MONEY CONCEPTS
@@ -476,7 +334,7 @@ def analyze_stock(name, instrument_key, err_rows):
         has_vol = df["Volume"].sum() > 0
         df = compute_vwap(df) if has_vol else df.assign(VWAP=df["Close"].expanding().mean())
 
-        df["EMA9"] = compute_ema(df["Close"], 9)
+        df["EMA8"] = compute_ema(df["Close"], 8)
         df["RSI"] = compute_rsi(df["Close"], 14)
         df["MACD"], df["MACD_Sig"] = compute_macd(df["Close"])
         df["ADX"], df["ATR_raw"] = compute_adx(df)
@@ -485,7 +343,7 @@ def analyze_stock(name, instrument_key, err_rows):
         df["CVD"] = compute_cvd_proxy(df) if has_vol else pd.Series(0, index=df.index)
 
         last = df.iloc[-1]
-        price, vwap, ema9 = last["Close"], last["VWAP"], last["EMA9"]
+        price, vwap, ema8 = last["Close"], last["VWAP"], last["EMA8"]
         rsi, macd, macd_s = last["RSI"], last["MACD"], last["MACD_Sig"]
         adx, atr = last["ADX"], last["ATR"]
 
@@ -504,24 +362,15 @@ def analyze_stock(name, instrument_key, err_rows):
         smc = detect_choch_bos(df)
         ob = detect_order_block(df, df["ATR"])
 
-        # ---- CPR Volume Profile: 30-min POC / VAH / VAL boxes for today's session ----
-        today = df["Datetime"].iloc[-1].date()
-        session_df = df[df["Datetime"].dt.date == today]
-        vp_boxes = compute_cpr_vp_boxes(session_df)
-        latest_vp = vp_boxes[-1] if vp_boxes else dict(poc=None, vah=None, val=None)
-
-        # ---- CPR (Central Pivot Range): TC / Pivot / BC from previous day's H/L/C ----
-        cpr = get_cpr_pivot(instrument_key)
-
         vol_raw = last["Volume"] if has_vol else 0
         volume = 0 if pd.isna(vol_raw) else int(vol_raw)
 
         checks_bull = {
-            "Price > VWAP": price > vwap, "Price > EMA9": price > ema9,
+            "Price > VWAP": price > vwap, "Price > EMA8": price > ema8,
             "RSI > 50": rsi > 50, "MACD > Signal": macd > macd_s, "ADX > 20": adx > 20,
         }
         checks_bear = {
-            "Price < VWAP": price < vwap, "Price < EMA9": price < ema9,
+            "Price < VWAP": price < vwap, "Price < EMA8": price < ema8,
             "RSI < 50": rsi < 50, "MACD < Signal": macd < macd_s, "ADX > 20": adx > 20,
         }
         bull, bear = all(checks_bull.values()), all(checks_bear.values())
@@ -530,7 +379,7 @@ def analyze_stock(name, instrument_key, err_rows):
 
         return dict(
             name=name, instrument_key=instrument_key, signal=signal,
-            price=round(price, 2), vwap=round(vwap, 2), ema9=round(ema9, 2),
+            price=round(price, 2), vwap=round(vwap, 2), ema8=round(ema8, 2),
             rsi=round(rsi, 1), macd=round(macd, 4), macd_sig=round(macd_s, 4),
             adx=round(adx, 1), atr=round(atr, 2),
             obv_rising=obv_rising, cvd_val=int(cvd_val), cvd_bull=cvd_bull, volume=volume,
@@ -538,8 +387,6 @@ def analyze_stock(name, instrument_key, err_rows):
             choch=smc["choch"], bos=smc["bos"], trend=smc["trend"],
             last_sh=smc["last_sh"], last_sl=smc["last_sl"],
             ob_type=ob["ob_type"], ob_high=ob["ob_high"], ob_low=ob["ob_low"], ob_fresh=ob["ob_fresh"],
-            poc=latest_vp["poc"], vah=latest_vp["vah"], val=latest_vp["val"], vp_boxes=vp_boxes,
-            cpr=cpr,
             checks=checks, df=df,
         )
     except Exception as e:
@@ -547,7 +394,7 @@ def analyze_stock(name, instrument_key, err_rows):
         return None
 
 # =========================================================
-# PLOTLY CHART — single price panel: candles, VWAP, EMA9, 30-min CPR VP boxes
+# PLOTLY CHART — single price panel: candles, VWAP, EMA8
 # =========================================================
 
 def build_chart(r):
@@ -564,58 +411,7 @@ def build_chart(r):
         whiskerwidth=0.4, name="Price",
     ))
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.4), name="VWAP"))
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"))
-
-    # ---- CPR Volume Profile: one dashed box per 30-min period (VAH/VAL band) ----
-    for box in (r.get("vp_boxes") or []):
-        fig.add_shape(
-            type="rect", x0=box["start"], x1=box["end"], y0=box["val"], y1=box["vah"],
-            line=dict(color=C_VP_BORDER, width=1.4, dash="dot"),
-            fillcolor=C_VP_FILL, layer="below",
-        )
-
-    # ---- CPR (Central Pivot Range): TC/Pivot/BC box from previous day's H/L/C ----
-    cpr = r.get("cpr")
-    if cpr and len(df) > 0:
-        x0, x1 = df["Datetime"].iloc[0], df["Datetime"].iloc[-1]
-        top, bottom = max(cpr["tc"], cpr["bc"]), min(cpr["tc"], cpr["bc"])
-
-        # Narrow-CPR days (TC/BC only a rupee or two apart) used to collapse
-        # into an invisible hairline at 8% opacity. Pad the drawn band by a
-        # small fraction of the visible price range so it always reads as a
-        # proper box, and bump the fill opacity so it's clearly visible.
-        price_span = float(df["High"].max() - df["Low"].min()) or 1.0
-        min_band = price_span * 0.004
-        draw_top, draw_bottom = top, bottom
-        if (draw_top - draw_bottom) < min_band:
-            mid = (draw_top + draw_bottom) / 2
-            draw_top, draw_bottom = mid + min_band / 2, mid - min_band / 2
-
-        fig.add_shape(
-            type="rect", x0=x0, x1=x1, y0=draw_bottom, y1=draw_top,
-            line=dict(color=C_CPR_BORDER, width=1.6, dash="dot"),
-            fillcolor="rgba(126,87,194,0.18)", layer="below",
-        )
-        fig.add_trace(go.Scatter(
-            x=[x0, x1], y=[cpr["pivot"], cpr["pivot"]], mode="lines",
-            line=dict(color=C_CPR_PIVOT, width=1.4, dash="dash"), name="CPR Pivot",
-        ))
-
-        # Single consolidated label (stacked lines, offset to the right of the
-        # last candle) instead of three separate annotations placed at their
-        # exact y-values — those used to overlap into unreadable text
-        # whenever TC/Pivot/BC were close together.
-        label_text = (
-            f"<b>TC</b> {cpr['tc']:.2f}<br>"
-            f"<b>P</b> {cpr['pivot']:.2f}<br>"
-            f"<b>BC</b> {cpr['bc']:.2f}"
-        )
-        fig.add_annotation(
-            x=x1, y=(draw_top + draw_bottom) / 2, text=label_text, showarrow=False,
-            xanchor="left", xshift=8, align="left",
-            font=dict(color=C_CPR_PIVOT, size=10),
-            bgcolor="rgba(255,255,255,0.85)", bordercolor=C_CPR_BORDER, borderwidth=1,
-        )
+    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA8"], line=dict(color=C_BIGC, width=1.2), name="EMA8"))
 
     pn = sum(r["checks"].values())
     fig.update_layout(
@@ -639,7 +435,7 @@ def build_chart(r):
 # =========================================================
 
 st.title("📡 Smart Money Intraday Scanner")
-st.caption("Live NSE intraday data via Upstox • Chart: VWAP / EMA9 / CPR 30-min Volume Profile boxes (POC/VAH/VAL) • Table: RSI/MACD/ADX/OBV/CVD/CHoCH/BOS/Order Blocks")
+st.caption("Live NSE intraday data via Upstox • Chart: VWAP / EMA8 • Table: RSI/MACD/ADX/OBV/CVD/CHoCH/BOS/Order Blocks")
 
 if not ensure_authenticated():
     st.stop()
@@ -700,9 +496,6 @@ for r in valid:
         ATR=r["atr"], OBV=("↑" if r["obv_rising"] else "↓"),
         CVD=("+" if r["cvd_bull"] else "") + f"{r['cvd_val']:,}",
         Trend=r["trend"], CHoCH=(r["choch"] or "—"), BOS=(r["bos"] or "—"),
-        POC=(r["poc"] if r["poc"] is not None else "—"),
-        VAH=(r["vah"] if r["vah"] is not None else "—"),
-        VAL=(r["val"] if r["val"] is not None else "—"),
         Score=f"{sum(r['checks'].values())}/5",
         BigCandle=("⚡" if r["big_candle"] else ""),
     ))
