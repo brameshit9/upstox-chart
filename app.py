@@ -49,12 +49,14 @@ INTRADAY_INTERVAL_MIN = "1"  # 1-minute candles via v3 intraday API
 VP_ROWS = 24            # number of price bins across each period's range (matches Pine "vpRows")
 VP_VALUE_AREA_PCT = 70  # % of volume that must sit inside VAH/VAL (matches Pine "valueAreaPct")
 VP_PERIOD_MIN = 30      # box period in minutes (the "CPR 30 min box")
+VP_MIN_BARS = 5         # skip a period's box if it has fewer 1-min candles than this (avoids noisy edge boxes)
 
-# Colour palette
-C_BULL, C_BEAR, C_NEUTRAL = "#1D9E75", "#D85A30", "#888780"
-C_BULL_BG, C_BEAR_BG, C_NEUT_BG = "#E8F7F1", "#FAECE7", "#F4F3EF"
-C_MUTED, C_BOS, C_BIGC, C_CHOCH = "#9A9590", "#2176AE", "#D4A000", "#7B5EA7"
-C_POC, C_VAH, C_VAL = "#B8860B", "#B23A48", "#2E7D32"  # POC / VAH / VAL line colors
+# Colour palette — TradingView-style
+C_BULL, C_BEAR, C_NEUTRAL = "#26A69A", "#EF5350", "#888780"
+C_BULL_BG, C_BEAR_BG, C_NEUT_BG = "#FFFFFF", "#FFFFFF", "#FFFFFF"
+C_MUTED, C_BOS, C_BIGC, C_CHOCH = "#9A9590", "#2196F3", "#FF9800", "#7B5EA7"
+C_GRID = "#E6E9EC"
+C_VP_BORDER, C_VP_FILL, C_POC = "#1E88E5", "rgba(30,136,229,0.10)", "#1E88E5"
 
 # NSE trading symbols to scan (subset shown; add/remove freely in the UI)
 STOCKS = [
@@ -324,7 +326,7 @@ def compute_cpr_vp_boxes(df, period_min=VP_PERIOD_MIN, rows=VP_ROWS, value_area_
 
     bucket = df["Datetime"].dt.floor(f"{period_min}min")
     for _, grp in df.groupby(bucket):
-        if grp.empty:
+        if len(grp) < VP_MIN_BARS:
             continue
         vp = compute_cpr_volume_profile(grp, rows=rows, value_area_pct=value_area_pct)
         if vp["poc"] is None:
@@ -507,38 +509,46 @@ def build_chart(r):
     df = r["df"]
     sig = r["signal"]
     accent = C_BULL if sig == "BULLISH" else (C_BEAR if sig == "BEARISH" else C_NEUTRAL)
-    bg = C_BULL_BG if sig == "BULLISH" else (C_BEAR_BG if sig == "BEARISH" else C_NEUT_BG)
 
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
         x=df["Datetime"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        increasing_line_color=C_BULL, decreasing_line_color=C_BEAR, name="Price",
+        increasing=dict(line=dict(color=C_BULL, width=1), fillcolor=C_BULL),
+        decreasing=dict(line=dict(color=C_BEAR, width=1), fillcolor=C_BEAR),
+        whiskerwidth=0.4, name="Price",
     ))
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.6), name="VWAP"))
+    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.4), name="VWAP"))
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"))
 
-    # ---- CPR Volume Profile: one banded box per 30-min period (POC line + VAH/VAL box) ----
+    # ---- CPR Volume Profile: one dashed box per 30-min period (VAH/VAL band + POC line) ----
     for i, box in enumerate(r.get("vp_boxes") or []):
         fig.add_shape(
             type="rect", x0=box["start"], x1=box["end"], y0=box["val"], y1=box["vah"],
-            line=dict(color=C_VAH, width=1), fillcolor="rgba(178,58,72,0.08)",
-            layer="below",
+            line=dict(color=C_VP_BORDER, width=1.4, dash="dot"),
+            fillcolor=C_VP_FILL, layer="below",
         )
         fig.add_trace(go.Scatter(
             x=[box["start"], box["end"]], y=[box["poc"], box["poc"]],
-            mode="lines", line=dict(color=C_POC, width=1.8),
+            mode="lines", line=dict(color=C_POC, width=1.6),
             name="POC" if i == 0 else None, showlegend=(i == 0),
             legendgroup="poc", hoverinfo="skip",
         ))
 
     pn = sum(r["checks"].values())
     fig.update_layout(
-        title=dict(text=f"{r['name']}   ₹{r['price']:.2f}   {sig} {pn}/5", font=dict(color=accent, size=16)),
-        height=520, margin=dict(l=40, r=20, t=50, b=20),
-        plot_bgcolor=bg, paper_bgcolor="#FFFFFF",
-        xaxis_rangeslider_visible=False, showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
+        title=dict(text=f"{r['name']}   ₹{r['price']:.2f}   {sig} {pn}/5", font=dict(color=accent, size=15)),
+        height=480, margin=dict(l=40, r=20, t=45, b=20),
+        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        font=dict(color="#4A4A4A", size=11),
+        xaxis=dict(rangeslider_visible=False, showgrid=True, gridcolor=C_GRID, gridwidth=1,
+                    showline=False, zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor=C_GRID, gridwidth=1, showline=False, zeroline=False,
+                    side="right"),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
+                     bgcolor="rgba(0,0,0,0)"),
+        hovermode="x unified",
     )
     return fig
 
