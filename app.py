@@ -1,25 +1,11 @@
 # =========================================================
-# SMART MONEY INTRADAY SCANNER — Upstox + Streamlit  (v11)
+# SMART MONEY INTRADAY SCANNER — Upstox + Streamlit  (v11 + CPR VP)
 # =========================================================
-# Rewritten to actually run on Streamlit, using the real Upstox
-# REST API (OAuth2 login flow + v3 intraday candle API) instead
-# of the undefined `fetch_intraday()` / matplotlib+IPython loop
-# from the previous version.
-#
-# SETUP
-# -----
-# 1. Create an app at https://account.upstox.com/developer/apps
-#    - Redirect URI must exactly match what you put in secrets
-#      below (e.g. the URL of your deployed Streamlit app).
-# 2. Put these in Streamlit secrets (.streamlit/secrets.toml
-#    locally, or "Settings -> Secrets" on Streamlit Cloud):
-#
-#       UPSTOX_API_KEY = "your_api_key"
-#       UPSTOX_API_SECRET = "your_api_secret"
-#       UPSTOX_REDIRECT_URI = "https://your-app.streamlit.app"
-#
-# 3. `pip install -r requirements.txt`
-# 4. `streamlit run app.py`
+# Same as v11, with ONE addition: CPR-period Volume Profile
+# (POC / VAH / VAL) computed from the day's intraday candles,
+# mirroring the binning + value-area-expansion logic used in
+# the Pine Script indicator's volume profile section.
+# Nothing else was changed.
 # =========================================================
 
 import gzip
@@ -59,10 +45,15 @@ OBV_SLOPE_N = 5
 SMC_IMPULSE = 1.2
 INTRADAY_INTERVAL_MIN = "1"  # 1-minute candles via v3 intraday API
 
+# ---- CPR Volume Profile (POC / VAH / VAL) settings ----
+VP_ROWS = 24            # number of price bins across the day's range (matches Pine "vpRows")
+VP_VALUE_AREA_PCT = 70  # % of volume that must sit inside VAH/VAL (matches Pine "valueAreaPct")
+
 # Colour palette
 C_BULL, C_BEAR, C_NEUTRAL = "#1D9E75", "#D85A30", "#888780"
 C_BULL_BG, C_BEAR_BG, C_NEUT_BG = "#E8F7F1", "#FAECE7", "#F4F3EF"
 C_MUTED, C_BOS, C_BIGC, C_CHOCH = "#9A9590", "#2176AE", "#D4A000", "#7B5EA7"
+C_POC, C_VAH, C_VAL = "#B8860B", "#B23A48", "#2E7D32"  # POC / VAH / VAL line colors
 
 # NSE trading symbols to scan (subset shown; add/remove freely in the UI)
 STOCKS = [
@@ -253,6 +244,71 @@ def compute_atr(df, period=ATR_PERIOD):
     return tr.rolling(period).mean()
 
 # =========================================================
+# CPR VOLUME PROFILE — POC / VAH / VAL
+# (Same logic as the Pine Script's volume-profile block:
+#  bin the current session's candles by typical price, find
+#  the highest-volume bin (POC), then expand outward bin by
+#  bin — always stepping to whichever side has more volume —
+#  until the accumulated volume reaches VP_VALUE_AREA_PCT of
+#  the day's total. VAH/VAL are the outer edges of that band.)
+# =========================================================
+
+def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
+    """
+    df: intraday dataframe for the CURRENT session only (already sliced to today).
+    Returns dict(poc=None, vah=None, val=None) if not enough data.
+    """
+    result = dict(poc=None, vah=None, val=None)
+    if df is None or len(df) == 0:
+        return result
+
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    vols = df["Volume"].fillna(0).values
+
+    range_high = np.nanmax(highs)
+    range_low = np.nanmin(lows)
+    bin_size = (range_high - range_low) / rows
+    if not np.isfinite(bin_size) or bin_size <= 0:
+        return result
+
+    vol_bins = np.zeros(rows, dtype=float)
+    typ_price = (highs + lows + closes) / 3.0
+    bin_idx = np.floor((typ_price - range_low) / bin_size).astype(int)
+    bin_idx = np.clip(bin_idx, 0, rows - 1)
+    for idx, v in zip(bin_idx, vols):
+        vol_bins[idx] += v
+
+    total_vol = vol_bins.sum()
+    if total_vol <= 0:
+        return result
+
+    poc_idx = int(np.argmax(vol_bins))
+    target = total_vol * value_area_pct / 100.0
+    cum_vol = vol_bins[poc_idx]
+    lo_lim = hi_lim = poc_idx
+
+    while cum_vol < target and (lo_lim > 0 or hi_lim < rows - 1):
+        vol_below = vol_bins[lo_lim - 1] if lo_lim > 0 else -1.0
+        vol_above = vol_bins[hi_lim + 1] if hi_lim < rows - 1 else -1.0
+        if vol_below >= vol_above:
+            lo_lim -= 1
+            cum_vol += vol_below
+        else:
+            hi_lim += 1
+            cum_vol += vol_above
+
+    poc_price = range_low + poc_idx * bin_size + bin_size / 2
+    vah_price = range_low + (hi_lim + 1) * bin_size
+    val_price = range_low + lo_lim * bin_size
+
+    result["poc"] = round(float(poc_price), 2)
+    result["vah"] = round(float(vah_price), 2)
+    result["val"] = round(float(val_price), 2)
+    return result
+
+# =========================================================
 # SMART MONEY CONCEPTS
 # =========================================================
 
@@ -377,6 +433,11 @@ def analyze_stock(name, instrument_key, err_rows):
         smc = detect_choch_bos(df)
         ob = detect_order_block(df, df["ATR"])
 
+        # ---- CPR Volume Profile: POC / VAH / VAL for today's session ----
+        today = df["Datetime"].iloc[-1].date()
+        session_df = df[df["Datetime"].dt.date == today]
+        vp = compute_cpr_volume_profile(session_df)
+
         vol_raw = last["Volume"] if has_vol else 0
         volume = 0 if pd.isna(vol_raw) else int(vol_raw)
 
@@ -402,6 +463,7 @@ def analyze_stock(name, instrument_key, err_rows):
             choch=smc["choch"], bos=smc["bos"], trend=smc["trend"],
             last_sh=smc["last_sh"], last_sl=smc["last_sl"],
             ob_type=ob["ob_type"], ob_high=ob["ob_high"], ob_low=ob["ob_low"], ob_fresh=ob["ob_fresh"],
+            poc=vp["poc"], vah=vp["vah"], val=vp["val"],
             checks=checks, df=df,
         )
     except Exception as e:
@@ -430,6 +492,20 @@ def build_chart(r):
     ), row=1, col=1)
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.6), name="VWAP"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"), row=1, col=1)
+
+    # ---- CPR Volume Profile lines: POC / VAH / VAL ----
+    if r.get("poc") is not None:
+        fig.add_hline(y=r["poc"], line=dict(color=C_POC, width=1.6, dash="solid"),
+                      annotation_text=f"POC {r['poc']}", annotation_position="right",
+                      annotation_font_color=C_POC, row=1, col=1)
+    if r.get("vah") is not None:
+        fig.add_hline(y=r["vah"], line=dict(color=C_VAH, width=1.2, dash="dot"),
+                      annotation_text=f"VAH {r['vah']}", annotation_position="right",
+                      annotation_font_color=C_VAH, row=1, col=1)
+    if r.get("val") is not None:
+        fig.add_hline(y=r["val"], line=dict(color=C_VAL, width=1.2, dash="dot"),
+                      annotation_text=f"VAL {r['val']}", annotation_position="right",
+                      annotation_font_color=C_VAL, row=1, col=1)
 
     rsi_col = C_BULL if r["rsi"] > 50 else C_BEAR
     fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], line=dict(color=rsi_col, width=1.2), name="RSI", showlegend=False), row=2, col=1)
@@ -467,7 +543,7 @@ def build_chart(r):
 # =========================================================
 
 st.title("📡 Smart Money Intraday Scanner")
-st.caption("Live NSE intraday data via Upstox • VWAP / EMA9 / RSI / MACD / ADX • OBV & CVD flow • CHoCH / BOS / Order Blocks")
+st.caption("Live NSE intraday data via Upstox • VWAP / EMA9 / RSI / MACD / ADX • OBV & CVD flow • CHoCH / BOS / Order Blocks • CPR Volume Profile (POC/VAH/VAL)")
 
 if not ensure_authenticated():
     st.stop()
@@ -528,6 +604,9 @@ for r in valid:
         ATR=r["atr"], OBV=("↑" if r["obv_rising"] else "↓"),
         CVD=("+" if r["cvd_bull"] else "") + f"{r['cvd_val']:,}",
         Trend=r["trend"], CHoCH=(r["choch"] or "—"), BOS=(r["bos"] or "—"),
+        POC=(r["poc"] if r["poc"] is not None else "—"),
+        VAH=(r["vah"] if r["vah"] is not None else "—"),
+        VAL=(r["val"] if r["val"] is not None else "—"),
         Score=f"{sum(r['checks'].values())}/5",
         BigCandle=("⚡" if r["big_candle"] else ""),
     ))
