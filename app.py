@@ -314,18 +314,24 @@ def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PC
 
 def compute_cpr_vp_boxes(df, period_min=VP_PERIOD_MIN, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
     """
-    Splits the session into consecutive `period_min` (e.g. 30-min) buckets and
-    computes a separate POC/VAH/VAL for each bucket — same banded/gapped box
-    look as the Pine Script CPR/Volume-Profile block, but derived from the
-    live intraday candles instead of a security() pivot timeframe.
+    Splits the session into consecutive `period_min` (e.g. 30-min) buckets,
+    aligned to the session's FIRST candle (market open, e.g. 9:15) rather
+    than clock boundaries (9:00/9:30) — so each box is a clean, full 30-min
+    window: 9:15-9:45, 9:45-10:15, 10:15-10:45, etc. Computes a separate
+    POC/VAH/VAL for each bucket — same banded/gapped box look as the Pine
+    Script CPR/Volume-Profile block, but derived from the live intraday
+    candles instead of a security() pivot timeframe.
     Returns a list of dicts: start, end, poc, vah, val (chronological order).
     """
     boxes = []
     if df is None or len(df) == 0:
         return boxes
 
-    bucket = df["Datetime"].dt.floor(f"{period_min}min")
-    for _, grp in df.groupby(bucket):
+    session_start = df["Datetime"].iloc[0]
+    elapsed_min = (df["Datetime"] - session_start).dt.total_seconds() / 60.0
+    bucket_idx = np.floor(elapsed_min / period_min).astype(int)
+
+    for _, grp in df.groupby(bucket_idx):
         if len(grp) < VP_MIN_BARS:
             continue
         vp = compute_cpr_volume_profile(grp, rows=rows, value_area_pct=value_area_pct)
