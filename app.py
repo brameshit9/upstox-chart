@@ -46,8 +46,9 @@ SMC_IMPULSE = 1.2
 INTRADAY_INTERVAL_MIN = "1"  # 1-minute candles via v3 intraday API
 
 # ---- CPR Volume Profile (POC / VAH / VAL) settings ----
-VP_ROWS = 24            # number of price bins across the day's range (matches Pine "vpRows")
+VP_ROWS = 24            # number of price bins across each period's range (matches Pine "vpRows")
 VP_VALUE_AREA_PCT = 70  # % of volume that must sit inside VAH/VAL (matches Pine "valueAreaPct")
+VP_PERIOD_MIN = 30      # box period in minutes (the "CPR 30 min box")
 
 # Colour palette
 C_BULL, C_BEAR, C_NEUTRAL = "#1D9E75", "#D85A30", "#888780"
@@ -308,6 +309,33 @@ def compute_cpr_volume_profile(df, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PC
     result["val"] = round(float(val_price), 2)
     return result
 
+
+def compute_cpr_vp_boxes(df, period_min=VP_PERIOD_MIN, rows=VP_ROWS, value_area_pct=VP_VALUE_AREA_PCT):
+    """
+    Splits the session into consecutive `period_min` (e.g. 30-min) buckets and
+    computes a separate POC/VAH/VAL for each bucket — same banded/gapped box
+    look as the Pine Script CPR/Volume-Profile block, but derived from the
+    live intraday candles instead of a security() pivot timeframe.
+    Returns a list of dicts: start, end, poc, vah, val (chronological order).
+    """
+    boxes = []
+    if df is None or len(df) == 0:
+        return boxes
+
+    bucket = df["Datetime"].dt.floor(f"{period_min}min")
+    for _, grp in df.groupby(bucket):
+        if grp.empty:
+            continue
+        vp = compute_cpr_volume_profile(grp, rows=rows, value_area_pct=value_area_pct)
+        if vp["poc"] is None:
+            continue
+        boxes.append(dict(
+            start=grp["Datetime"].iloc[0],
+            end=grp["Datetime"].iloc[-1],
+            poc=vp["poc"], vah=vp["vah"], val=vp["val"],
+        ))
+    return boxes
+
 # =========================================================
 # SMART MONEY CONCEPTS
 # =========================================================
@@ -433,10 +461,11 @@ def analyze_stock(name, instrument_key, err_rows):
         smc = detect_choch_bos(df)
         ob = detect_order_block(df, df["ATR"])
 
-        # ---- CPR Volume Profile: POC / VAH / VAL for today's session ----
+        # ---- CPR Volume Profile: 30-min POC / VAH / VAL boxes for today's session ----
         today = df["Datetime"].iloc[-1].date()
         session_df = df[df["Datetime"].dt.date == today]
-        vp = compute_cpr_volume_profile(session_df)
+        vp_boxes = compute_cpr_vp_boxes(session_df)
+        latest_vp = vp_boxes[-1] if vp_boxes else dict(poc=None, vah=None, val=None)
 
         vol_raw = last["Volume"] if has_vol else 0
         volume = 0 if pd.isna(vol_raw) else int(vol_raw)
@@ -463,7 +492,7 @@ def analyze_stock(name, instrument_key, err_rows):
             choch=smc["choch"], bos=smc["bos"], trend=smc["trend"],
             last_sh=smc["last_sh"], last_sl=smc["last_sl"],
             ob_type=ob["ob_type"], ob_high=ob["ob_high"], ob_low=ob["ob_low"], ob_fresh=ob["ob_fresh"],
-            poc=vp["poc"], vah=vp["vah"], val=vp["val"],
+            poc=latest_vp["poc"], vah=latest_vp["vah"], val=latest_vp["val"], vp_boxes=vp_boxes,
             checks=checks, df=df,
         )
     except Exception as e:
@@ -471,7 +500,7 @@ def analyze_stock(name, instrument_key, err_rows):
         return None
 
 # =========================================================
-# PLOTLY CHART — 4-panel, one per stock
+# PLOTLY CHART — single price panel: candles, VWAP, EMA9, 30-min CPR VP boxes
 # =========================================================
 
 def build_chart(r):
@@ -480,58 +509,33 @@ def build_chart(r):
     accent = C_BULL if sig == "BULLISH" else (C_BEAR if sig == "BEARISH" else C_NEUTRAL)
     bg = C_BULL_BG if sig == "BULLISH" else (C_BEAR_BG if sig == "BEARISH" else C_NEUT_BG)
 
-    fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.5, 0.17, 0.17, 0.16], vertical_spacing=0.03,
-        subplot_titles=("", "RSI", "MACD", "OBV / CVD"),
-    )
+    fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
         x=df["Datetime"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         increasing_line_color=C_BULL, decreasing_line_color=C_BEAR, name="Price",
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.6), name="VWAP"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"), row=1, col=1)
+    ))
+    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], line=dict(color=C_BOS, width=1.6), name="VWAP"))
+    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA9"], line=dict(color=C_BIGC, width=1.2), name="EMA9"))
 
-    # ---- CPR Volume Profile lines: POC / VAH / VAL ----
-    if r.get("poc") is not None:
-        fig.add_hline(y=r["poc"], line=dict(color=C_POC, width=1.6, dash="solid"),
-                      annotation_text=f"POC {r['poc']}", annotation_position="right",
-                      annotation_font_color=C_POC, row=1, col=1)
-    if r.get("vah") is not None:
-        fig.add_hline(y=r["vah"], line=dict(color=C_VAH, width=1.2, dash="dot"),
-                      annotation_text=f"VAH {r['vah']}", annotation_position="right",
-                      annotation_font_color=C_VAH, row=1, col=1)
-    if r.get("val") is not None:
-        fig.add_hline(y=r["val"], line=dict(color=C_VAL, width=1.2, dash="dot"),
-                      annotation_text=f"VAL {r['val']}", annotation_position="right",
-                      annotation_font_color=C_VAL, row=1, col=1)
-
-    rsi_col = C_BULL if r["rsi"] > 50 else C_BEAR
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], line=dict(color=rsi_col, width=1.2), name="RSI", showlegend=False), row=2, col=1)
-    fig.add_hline(y=70, line=dict(color=C_BEAR, dash="dot", width=1), row=2, col=1)
-    fig.add_hline(y=30, line=dict(color=C_BULL, dash="dot", width=1), row=2, col=1)
-
-    macd_hist = df["MACD"] - df["MACD_Sig"]
-    hist_colors = [C_BULL if v >= 0 else C_BEAR for v in macd_hist]
-    fig.add_trace(go.Bar(x=df["Datetime"], y=macd_hist, marker_color=hist_colors, opacity=0.5, name="Hist", showlegend=False), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD"], line=dict(color=C_BOS, width=1.1), name="MACD", showlegend=False), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD_Sig"], line=dict(color=C_BIGC, width=1.1), name="Signal", showlegend=False), row=3, col=1)
-
-    def norm(s):
-        s = s.values.astype(float)
-        peak = np.nanmax(np.abs(s))
-        return s / peak if np.isfinite(peak) and peak != 0 else np.zeros_like(s)
-
-    obv_col = C_BULL if r["obv_rising"] else C_BEAR
-    cvd_col = C_BULL if r["cvd_bull"] else C_BEAR
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=norm(df["OBV"]), line=dict(color=obv_col, width=1.2), name="OBV", showlegend=False), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df["Datetime"], y=norm(df["CVD"]), line=dict(color=cvd_col, width=1.1, dash="dash"), name="CVD", showlegend=False), row=4, col=1)
+    # ---- CPR Volume Profile: one banded box per 30-min period (POC line + VAH/VAL box) ----
+    for i, box in enumerate(r.get("vp_boxes") or []):
+        fig.add_shape(
+            type="rect", x0=box["start"], x1=box["end"], y0=box["val"], y1=box["vah"],
+            line=dict(color=C_VAH, width=1), fillcolor="rgba(178,58,72,0.08)",
+            layer="below",
+        )
+        fig.add_trace(go.Scatter(
+            x=[box["start"], box["end"]], y=[box["poc"], box["poc"]],
+            mode="lines", line=dict(color=C_POC, width=1.8),
+            name="POC" if i == 0 else None, showlegend=(i == 0),
+            legendgroup="poc", hoverinfo="skip",
+        ))
 
     pn = sum(r["checks"].values())
     fig.update_layout(
         title=dict(text=f"{r['name']}   ₹{r['price']:.2f}   {sig} {pn}/5", font=dict(color=accent, size=16)),
-        height=650, margin=dict(l=40, r=20, t=50, b=20),
+        height=520, margin=dict(l=40, r=20, t=50, b=20),
         plot_bgcolor=bg, paper_bgcolor="#FFFFFF",
         xaxis_rangeslider_visible=False, showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
@@ -543,7 +547,7 @@ def build_chart(r):
 # =========================================================
 
 st.title("📡 Smart Money Intraday Scanner")
-st.caption("Live NSE intraday data via Upstox • VWAP / EMA9 / RSI / MACD / ADX • OBV & CVD flow • CHoCH / BOS / Order Blocks • CPR Volume Profile (POC/VAH/VAL)")
+st.caption("Live NSE intraday data via Upstox • Chart: VWAP / EMA9 / CPR 30-min Volume Profile boxes (POC/VAH/VAL) • Table: RSI/MACD/ADX/OBV/CVD/CHoCH/BOS/Order Blocks")
 
 if not ensure_authenticated():
     st.stop()
